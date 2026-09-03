@@ -3,18 +3,10 @@ name: BIP39 Scanner
 on:
   workflow_dispatch:
     inputs:
-      random_shuffles:
-        description: 'Number of random shuffles per run (0 = full 12! enumeration)'
-        required: false
-        default: '100000'
       threads:
         description: 'Worker threads'
         required: false
-        default: '4'
-      checkpoint_artifact:
-        description: 'Artifact name for checkpoint persistence'
-        required: false
-        default: 'bip39-checkpoint'
+        default: '8'
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,27 +41,25 @@ jobs:
       - name: Download previous checkpoint
         uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.checkpoint_artifact || 'bip39-checkpoint' }}
+          name: bip39-checkpoint
           path: .
         continue-on-error: true
 
-      - name: Scan permutations
+      - name: Scan all 12! permutations
         run: |
           ./target/release/bip39-scanner check \
             -t bc1qcv84707v4sglaj306qezkcrun4eejh77k8cyjr \
             --words mad shop faint hub shock motion style fall lift excess episode bless \
-            --random-shuffles ${{ inputs.random_shuffles || '100000' }} \
             --checkpoint cp.json \
             --resume \
-            -T ${{ inputs.threads || '4' }} || exit_code=$?
-          # exit 3 = no match found (expected), only fail on real errors
+            -T ${{ inputs.threads || '8' }} || exit_code=$?
           if [ "${exit_code:-0}" -ne 3 ]; then exit "${exit_code:-0}"; fi
           echo "No match this run. Checkpoint saved for next run."
 
       - name: Upload checkpoint
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.checkpoint_artifact || 'bip39-checkpoint' }}
+          name: bip39-checkpoint
           path: cp.json
           retention-days: 90
           overwrite: true
