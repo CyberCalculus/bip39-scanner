@@ -61,7 +61,10 @@ jobs:
             --random-shuffles ${{ inputs.random_shuffles || '100000' }} \
             --checkpoint cp.json \
             --resume \
-            -T ${{ inputs.threads || '4' }}
+            -T ${{ inputs.threads || '4' }} || exit_code=$?
+          # exit 3 = no match found (expected), only fail on real errors
+          if [ "${exit_code:-0}" -ne 3 ]; then exit "${exit_code:-0}"; fi
+          echo "No match this run. Checkpoint saved for next run."
 
       - name: Upload checkpoint
         uses: actions/upload-artifact@v4
