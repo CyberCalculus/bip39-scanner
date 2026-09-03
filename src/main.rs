@@ -2,23 +2,24 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
 use bip39_scanner::bip39::Bip39;
 use bip39_scanner::bip32::Bip32;
-use bip39_scanner::checkpoint::{Checkpoint, ScanState};
+use bip39_scanner::checkpoint::{timestamp as cp_timestamp, CheckCheckpoint, Checkpoint, ScanState};
 use bip39_scanner::config::Config;
 use bip39_scanner::ticket::TicketManager;
+use bip39_scanner::ui;
 
 #[derive(Parser)]
 #[command(name = "bip39-scanner")]
 #[command(
     about = "BIP39 mnemonic scanner with checkpoint and ticket system. \
-             All crypto primitives (SHA256/512, HMAC, RIPEMD160, PBKDF2, secp256k1, Bech32) \
-             are implemented from scratch — no external crypto crates."
+             All crypto delegated to audited crates (k256, bech32, sha2, ripemd, hmac, pbkdf2, getrandom). \
+             Multi-threaded via std::thread."
 )]
 #[command(version, long_about = None)]
 struct Cli {
@@ -125,7 +126,7 @@ enum Commands {
         mnemonics_file: Option<String>,
 
         /// Single target bech32 address.
-        #[arg(short, long)]
+        #[arg(short = 't', long)]
         target: Option<String>,
 
         /// Vanity prefix to match (e.g. "bc1qw"). Hits on any address starting with it.
@@ -137,7 +138,7 @@ enum Commands {
         targets_file: Option<String>,
 
         /// Optional BIP39 passphrase.
-        #[arg(short, long, default_value = "")]
+        #[arg(short = 'p', long, default_value = "")]
         passphrase: String,
 
         /// BIP32 derivation path.
@@ -162,6 +163,32 @@ enum Commands {
         /// Maximum number of random attempts before giving up (0 = unlimited).
         #[arg(long, default_value_t = 0)]
         max_attempts: u32,
+
+        /// Path to checkpoint file for --random mode. Saves progress so it can
+        /// be resumed later with --resume.
+        #[arg(long)]
+        checkpoint: Option<String>,
+
+        /// Resume from the saved checkpoint instead of starting fresh.
+        #[arg(long)]
+        resume: bool,
+
+        /// Number of worker threads (default: auto-detect from CPU count).
+        #[arg(short = 'T', long)]
+        threads: Option<usize>,
+
+        /// Space-separated list of 12 words to permute. Checks all 12! orderings
+        /// against the target. Only valid-BIP39 permutations are tested.
+        #[arg(long, num_args = 1..)]
+        words: Option<Vec<String>>,
+
+        /// Number of random word shuffles to test (instead of all permutations).
+        #[arg(long)]
+        random_shuffles: Option<u64>,
+
+        /// Number of tickets for work distribution (default: 1).
+        #[arg(long)]
+        tickets: Option<u64>,
     },
     /// Generate one or more random mnemonics.
     Generate {
@@ -205,6 +232,11 @@ enum CheckpointAction {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Detect verbose from scan subcommand for logger init
+    let verbose = matches!(&cli.command, Commands::Scan { verbose: true, .. });
+    ui::init_logger(verbose);
+    ui::banner();
 
     match cli.command {
         Commands::Scan {
@@ -259,6 +291,12 @@ fn main() {
             quiet,
             random,
             max_attempts,
+            checkpoint,
+            resume,
+            threads,
+            words,
+            random_shuffles,
+            tickets,
         } => {
             let exit = cmd_check(
                 mnemonic,
@@ -272,6 +310,12 @@ fn main() {
                 quiet,
                 random,
                 max_attempts,
+                checkpoint,
+                resume,
+                threads,
+                words,
+                random_shuffles,
+                tickets,
             );
             if exit != 0 {
                 std::process::exit(exit);
@@ -389,29 +433,51 @@ fn cmd_scan(
         let m = match mnemonic {
             Some(m) => m,
             None => {
-                eprintln!("--validity requires --mnemonic");
+                ui::error("--validity requires --mnemonic");
                 return;
             }
         };
+        log::info!("Validating mnemonic: {}", m);
         let words: Vec<&str> = m.split_whitespace().collect();
         match Bip39::validate(&words) {
             Ok(()) => {
-                println!("VALID mnemonic: {}", m);
+                ui::success(&format!("Mnemonic is VALID: {}", m));
                 let seed = Bip39::mnemonic_to_seed(&words, &passphrase).unwrap();
-                let master = Bip32::from_seed(&seed);
-                let derived = Bip32::derive_path(&master, "m/84'/0'/0'/0/0");
-                let addr = Bip32::privkey_to_address(&derived.key).unwrap();
-                println!("Address: {}", addr);
+                log::debug!("Seed derived ({} bytes)", seed.len());
+                let master = match Bip32::from_seed(&seed) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        ui::error(&format!("Failed to derive master key: {}", e));
+                        return;
+                    }
+                };
+                log::debug!("Master key derived");
+                let derived = match Bip32::derive_path(&master, "m/84'/0'/0'/0/0") {
+                    Ok(d) => d,
+                    Err(e) => {
+                        ui::error(&format!("Failed to derive path: {}", e));
+                        return;
+                    }
+                };
+                log::debug!("Path derived");
+                let addr = match Bip32::privkey_to_address(&derived.key) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        ui::error(&format!("Failed to derive address: {}", e));
+                        return;
+                    }
+                };
+                ui::key_val("Address", &addr);
                 match (target.as_ref(), prefix.as_ref()) {
-                    (Some(t), _) if addr == *t => println!("*** MATCH FOUND ***"),
-                    (_, Some(p)) if addr.starts_with(p.as_str()) => println!("*** MATCH FOUND ***"),
-                    (Some(t), _) => println!("Does not match target: {}", t),
-                    (_, Some(p)) => println!("Does not match prefix: {}", p),
+                    (Some(t), _) if addr == *t => ui::success("MATCH FOUND"),
+                    (_, Some(p)) if addr.starts_with(p.as_str()) => ui::success("MATCH FOUND"),
+                    (Some(t), _) => ui::warn(&format!("Does not match target: {}", t)),
+                    (_, Some(p)) => ui::warn(&format!("Does not match prefix: {}", p)),
                     _ => {}
                 }
             }
             Err(e) => {
-                eprintln!("INVALID mnemonic: {}", e);
+                ui::error(&format!("INVALID mnemonic: {}", e));
             }
         }
         return;
@@ -420,14 +486,14 @@ fn cmd_scan(
     if let Some(ref m) = mnemonic {
         let words: Vec<&str> = m.split_whitespace().collect();
         if let Err(e) = Bip39::validate(&words) {
-            eprintln!("Invalid mnemonic: {}", e);
+            ui::error(&format!("Invalid mnemonic: {}", e));
             std::process::exit(1);
         }
     }
 
     let config = if let Some(ref path) = config_path {
         Config::load(path).unwrap_or_else(|e| {
-            eprintln!("Failed to load config: {}, using defaults", e);
+            ui::warn(&format!("Failed to load config: {}, using defaults", e));
             Config::default()
         })
     } else {
@@ -450,7 +516,7 @@ fn cmd_scan(
     }), prefix, targets_file) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{}", e);
+            ui::error(&e.to_string());
             std::process::exit(2);
         }
     };
@@ -483,25 +549,24 @@ fn cmd_scan(
         match Checkpoint::load(&cp_path) {
             Ok(mut cp) => {
                 if matches!(cp.state, ScanState::Found) {
-                    println!("Target already found at: {}", cp.found_address.unwrap_or_default());
+                    ui::success(&format!("Target already found at: {}", cp.found_address.unwrap_or_default()));
                     return;
                 }
                 cp.state = ScanState::Running;
                 let _ = cp.save(&cp_path);
-                println!("Resuming from index {}", cp.current_index);
-                println!(
-                    "Scanned: {} / {} ({:.2}%)",
-                    cp.scanned_count,
-                    cp.total_combinations,
-                    cp.progress_pct()
-                );
-                println!("Rate: {:.0} mnemonics/sec", cp.rate());
+                ui::section("Resuming Scan");
+                ui::key_val_u64("From index", cp.current_index);
+                ui::key_val_u64("Scanned", cp.scanned_count);
+                ui::key_val_u64("Total", cp.total_combinations);
+                ui::key_val_f64("Progress %", cp.progress_pct());
+                ui::key_val_f64("Rate /s", cp.rate());
+                log::info!("Resuming from index {} ({:.2}%)", cp.current_index, cp.progress_pct());
 
                 run_scan(&params, cp.current_index, cp.total_combinations);
             }
             Err(e) => {
-                eprintln!("No checkpoint found: {}", e);
-                eprintln!("Starting fresh scan...");
+                ui::warn(&format!("No checkpoint found: {}", e));
+                ui::info("Starting fresh scan...");
                 run_scan_fresh(&params);
             }
         }
@@ -513,114 +578,173 @@ fn cmd_scan(
 fn run_scan_fresh(params: &ScanParams) {
     let total: u64 = 2048u64.pow(11);
 
-    println!("=== BIP39 Scanner ===");
+    ui::section("BIP39 Scanner");
     match params.mode {
-        MatchMode::Exact => println!("Target: {}", params.target),
-        MatchMode::Prefix => println!("Prefix: {}", params.prefix),
-        MatchMode::Any => println!("Targets: {} addresses", params.targets.len()),
+        MatchMode::Exact => ui::key_val("Target", &params.target),
+        MatchMode::Prefix => ui::key_val("Prefix", &params.prefix),
+        MatchMode::Any => ui::key_val_u64("Targets", params.targets.len() as u64),
     }
-    println!("Path: {}", params.path);
-    println!("Total combinations: {}", total);
-    println!("Ticket size: {}", params.ticket_size);
-    println!("Tickets: {}", (total + params.ticket_size - 1) / params.ticket_size);
-    println!();
+    ui::key_val("Path", &params.path);
+    ui::key_val_u64("Combinations", total);
+    ui::key_val_u64("Ticket size", params.ticket_size);
+    ui::key_val_u64("Tickets", (total + params.ticket_size - 1) / params.ticket_size);
+    ui::separator();
+
+    log::info!("Starting fresh scan: total={}, ticket_size={}", total, params.ticket_size);
 
     let mut cp = Checkpoint::new(total);
     cp.state = ScanState::Running;
     let _ = cp.save(&params.cp_path);
+    log::debug!("Initial checkpoint saved to {}", params.cp_path);
 
     let _tm = TicketManager::new(total, params.ticket_size);
     run_scan(params, 0, total);
 }
 
 fn run_scan(params: &ScanParams, start: u64, total: u64) {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
     let found = Arc::new(AtomicBool::new(false));
     let count = Arc::new(AtomicU64::new(start));
     let matched_addr = Arc::new(Mutex::new(None::<String>));
     let matched_mnemonic = Arc::new(Mutex::new(None::<Vec<String>>));
     let matched_index = Arc::new(AtomicU64::new(0));
 
-    let save_every = params.save_every;
+    let total_tickets = (total + params.ticket_size - 1) / params.ticket_size;
+    let ticket_counter = Arc::new(AtomicU64::new(0));
+
     let started = Instant::now();
 
-    let mut batch_count: u64 = 0;
-
-    let total_tickets = (total + params.ticket_size - 1) / params.ticket_size;
-
-    for ticket_id in 0..total_tickets {
-        if found.load(Ordering::Relaxed) {
-            break;
-        }
-        let ticket_start = ticket_id * params.ticket_size;
-        if ticket_start < start {
-            continue;
-        }
-        let ticket_end = std::cmp::min(ticket_start + params.ticket_size, total);
-
-        for idx in ticket_start..ticket_end {
-            if found.load(Ordering::Relaxed) {
+    // Background checkpoint saver
+    let cp_path = params.cp_path.clone();
+    let count_clone = Arc::clone(&count);
+    let found_clone = Arc::clone(&found);
+    let save_handle = std::thread::spawn(move || {
+        let mut last_save = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if found_clone.load(Ordering::Relaxed) {
                 break;
             }
-
-            let words = index_to_mnemonic(idx);
-            let seed = match Bip39::mnemonic_to_seed(&words, &params.passphrase) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let master = Bip32::from_seed(&seed);
-            let derived = Bip32::derive_path(&master, &params.path);
-            let addr = match Bip32::privkey_to_address(&derived.key) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-
-            let matched = match params.mode {
-                MatchMode::Exact => addr == params.target,
-                MatchMode::Prefix => addr.starts_with(&params.prefix),
-                MatchMode::Any => params.targets.contains(&addr),
-            };
-
-            if matched {
-                found.store(true, Ordering::Relaxed);
-                *matched_addr.lock().unwrap() = Some(addr.clone());
-                *matched_mnemonic.lock().unwrap() = Some(words.iter().map(|s| s.to_string()).collect());
-                matched_index.store(idx, Ordering::Relaxed);
-                count.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
-
-            batch_count += 1;
-            let current = count.fetch_add(1, Ordering::Relaxed) + 1;
-
-            if params.verbose && batch_count % 10000 == 0 {
-                let elapsed = started.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 { (current - start) as f64 / elapsed } else { 0.0 };
-                eprint!("\rScanned: {} | Rate: {:.0}/s", current, rate);
-            }
-
-            if batch_count >= save_every {
-                batch_count = 0;
-                let mut cp = Checkpoint::load(&params.cp_path)
+            let current = count_clone.load(Ordering::Relaxed);
+            if current > last_save + 100000 {
+                let mut cp = Checkpoint::load(&cp_path)
                     .unwrap_or_else(|_| Checkpoint::new(total));
                 cp.state = ScanState::Running;
                 cp.update(current, current);
-                let _ = cp.save(&params.cp_path);
-
-                let elapsed = started.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 { (current - start) as f64 / elapsed } else { 0.0 };
-                eprint!(
-                    "\rProgress: {:.4}% | Scanned: {} | Rate: {:.0}/s | Checkpoint saved",
-                    (current as f64 / total as f64) * 100.0,
-                    current,
-                    rate
-                );
+                let _ = cp.save(&cp_path);
+                last_save = current;
             }
         }
+    });
 
-        if found.load(Ordering::Relaxed) {
-            break;
-        }
+    ui::info(&format!("Starting scan with {} threads...", num_threads));
+
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for _thread_id in 0..num_threads {
+        let params = ScanParams {
+            mode: params.mode,
+            target: params.target.clone(),
+            prefix: params.prefix.clone(),
+            targets: params.targets.clone(),
+            path: params.path.clone(),
+            passphrase: params.passphrase.clone(),
+            cp_path: params.cp_path.clone(),
+            ticket_size: params.ticket_size,
+            save_every: params.save_every,
+            export_path: params.export_path.clone(),
+            verbose: params.verbose,
+        };
+
+        let found = Arc::clone(&found);
+        let count = Arc::clone(&count);
+        let matched_addr = Arc::clone(&matched_addr);
+        let matched_mnemonic = Arc::clone(&matched_mnemonic);
+        let matched_index = Arc::clone(&matched_index);
+        let ticket_counter = Arc::clone(&ticket_counter);
+
+        let handle = std::thread::spawn(move || {
+            let mut local_count: u64 = 0;
+            let mut local_batch: u64 = 0;
+
+            loop {
+                if found.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let ticket_id = ticket_counter.fetch_add(1, Ordering::Relaxed);
+                if ticket_id >= total_tickets {
+                    break;
+                }
+
+                let ticket_start = ticket_id * params.ticket_size;
+                let ticket_end = std::cmp::min(ticket_start + params.ticket_size, total);
+
+                for idx in ticket_start..ticket_end {
+                    if found.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let words = index_to_mnemonic(idx);
+                    let seed = match Bip39::mnemonic_to_seed(&words, &params.passphrase) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let master = match Bip32::from_seed(&seed) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let derived = match Bip32::derive_path(&master, &params.path) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    let addr = match Bip32::privkey_to_address(&derived.key) {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+
+                    let matched = match params.mode {
+                        MatchMode::Exact => addr == params.target,
+                        MatchMode::Prefix => addr.starts_with(&params.prefix),
+                        MatchMode::Any => params.targets.contains(&addr),
+                    };
+
+                    if matched {
+                        found.store(true, Ordering::Relaxed);
+                        *matched_addr.lock().unwrap() = Some(addr.clone());
+                        *matched_mnemonic.lock().unwrap() = Some(words.iter().map(|s| s.to_string()).collect());
+                        matched_index.store(idx, Ordering::Relaxed);
+                        break;
+                    }
+
+                    local_count += 1;
+                    local_batch += 1;
+                    count.fetch_add(1, Ordering::Relaxed);
+
+                    if params.verbose && local_batch % 10000 == 0 {
+                        let elapsed = started.elapsed().as_secs_f64();
+                        let current = count.load(Ordering::Relaxed);
+                        let rate = if elapsed > 0.0 { (current - start) as f64 / elapsed } else { 0.0 };
+                        ui::progress(current, 0, 0, rate);
+                    }
+                }
+            }
+
+            local_count
+        });
+
+        handles.push(handle);
     }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    found.store(true, Ordering::Relaxed);
+    let _ = save_handle.join();
 
     let final_count = count.load(Ordering::Relaxed);
     let mut cp = Checkpoint::load(&params.cp_path).unwrap_or_else(|_| Checkpoint::new(total));
@@ -629,25 +753,26 @@ fn run_scan(params: &ScanParams, start: u64, total: u64) {
     let hit_index = matched_index.load(Ordering::Relaxed);
 
     println!();
-    if found.load(Ordering::Relaxed) {
+    ui::separator();
+    if found.load(Ordering::Relaxed) && addr.is_some() {
         let addr = addr.unwrap_or_default();
         let mnemonic = mnemonic.unwrap_or_default();
-        println!("*** TARGET FOUND ***");
-        println!("Mnemonic: {}", mnemonic.join(" "));
-        println!("Address: {}", addr);
-        println!("Index: {}", hit_index);
+        ui::match_found(0, &mnemonic.join(" "), &addr);
+        ui::key_val_u64("Index", hit_index);
         cp.state = ScanState::Found;
         cp.found_address = Some(addr.clone());
         cp.update(hit_index, final_count);
+        log::info!("Target found at index {}: {} -> {}", hit_index, mnemonic.join(" "), addr);
         if let Some(ref path) = params.export_path {
             export_hit(path, &mnemonic, &addr, hit_index);
         }
     } else {
-        println!("Scan complete. Target not found.");
-        println!("Total scanned: {}", final_count);
+        ui::info("Scan complete. Target not found.");
+        ui::key_val_u64("Total scanned", final_count);
         cp.state = ScanState::Completed;
         cp.update(final_count, final_count);
     }
+    ui::separator();
     let _ = cp.save(&params.cp_path);
 }
 
@@ -662,12 +787,12 @@ fn export_hit(path: &str, mnemonic: &[String], addr: &str, index: u64) {
     let mut file = match OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Failed to open export file '{}': {}", path, e);
+            ui::error(&format!("Failed to open export file '{}': {}", path, e));
             return;
         }
     };
     if let Err(e) = file.write_all(line.as_bytes()) {
-        eprintln!("Failed to write export: {}", e);
+        ui::error(&format!("Failed to write export: {}", e));
     }
 }
 
@@ -692,29 +817,343 @@ fn index_to_mnemonic(index: u64) -> Vec<&'static str> {
 fn cmd_validate(mnemonic: &str, passphrase: &str, path: &str) {
     let words: Vec<&str> = mnemonic.split_whitespace().collect();
 
-    println!("Validating: {}", mnemonic);
-    println!("Word count: {}", words.len());
+    ui::section("Validate Mnemonic");
+    ui::key_val("Mnemonic", mnemonic);
+    ui::key_val_u64("Word count", words.len() as u64);
+    log::info!("Validating mnemonic with {} words", words.len());
 
     let (valid, total, invalid) = Bip39::validate_partial(&words);
-    println!("Valid words: {}/{}", valid, total);
+    ui::key_val(&format!("Valid words"), &format!("{}/{}", valid, total));
 
     if !invalid.is_empty() {
-        println!("Invalid words: {:?}", invalid);
+        ui::warn(&format!("Invalid words: {:?}", invalid));
     }
 
     match Bip39::validate(&words) {
         Ok(()) => {
-            println!("Result: VALID");
+            ui::success("Result: VALID");
+            log::debug!("Mnemonic validated, deriving seed...");
             let seed = Bip39::mnemonic_to_seed(&words, passphrase).unwrap();
-            let master = Bip32::from_seed(&seed);
-            let derived = Bip32::derive_path(&master, path);
-            let addr = Bip32::privkey_to_address(&derived.key).unwrap();
-            println!("First address: {}", addr);
+            log::debug!("Seed derived ({} bytes)", seed.len());
+            let master = match Bip32::from_seed(&seed) {
+                Ok(m) => m,
+                Err(e) => {
+                    ui::error(&format!("Failed to derive master key: {}", e));
+                    return;
+                }
+            };
+            let derived = match Bip32::derive_path(&master, path) {
+                Ok(d) => d,
+                Err(e) => {
+                    ui::error(&format!("Failed to derive path: {}", e));
+                    return;
+                }
+            };
+            let addr = match Bip32::privkey_to_address(&derived.key) {
+                Ok(a) => a,
+                Err(e) => {
+                    ui::error(&format!("Failed to derive address: {}", e));
+                    return;
+                }
+            };
+            ui::separator();
+            ui::key_val("First address", &addr);
+            ui::key_val("Path", path);
         }
         Err(e) => {
-            println!("Result: INVALID - {}", e);
+            ui::error(&format!("Result: INVALID - {}", e));
         }
     }
+}
+
+fn factorial(n: usize) -> u64 {
+    (1..=n as u64).product()
+}
+
+/// Generate all permutations of `words` and send each valid-BIP39 permutation
+/// into the channel. Returns the total number of permutations generated.
+fn send_permutations(
+    tx: &mpsc::Sender<CheckWorkItem>,
+    words: &mut [String],
+    start: usize,
+) -> u64 {
+    if start == words.len() - 1 {
+        let phrase = words.join(" ");
+        let word_refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        if Bip39::validate(&word_refs).is_ok() {
+            let _ = tx.send(CheckWorkItem::Mnemonic(phrase));
+        }
+        return 1;
+    }
+    let mut count = 0u64;
+    for i in start..words.len() {
+        words.swap(start, i);
+        count += send_permutations(tx, words, start + 1);
+        words.swap(start, i);
+    }
+    count
+}
+
+fn cmd_check_permutations(
+    words: &[String],
+    target: Option<String>,
+    prefix: Option<String>,
+    targets_file: Option<String>,
+    passphrase: String,
+    path: String,
+    stop_on_first_match: bool,
+    quiet: bool,
+    checkpoint_path: Option<String>,
+    resume: bool,
+    threads: Option<usize>,
+    random_count: Option<u64>,
+    num_tickets: Option<u64>,
+) -> i32 {
+    if words.len() != 12 {
+        ui::error(&format!("--words requires exactly 12 words, got {}", words.len()));
+        return 2;
+    }
+
+    for w in words {
+        if !Bip39::is_valid_word(w) {
+            ui::error(&format!("Unknown BIP39 word: {}", w));
+            return 2;
+        }
+    }
+
+    let mut chosen = 0;
+    if target.is_some() { chosen += 1; }
+    if prefix.is_some() { chosen += 1; }
+    if targets_file.is_some() { chosen += 1; }
+    if chosen == 0 {
+        ui::error("One of --target, --prefix, or --targets-file must be supplied");
+        return 2;
+    }
+    if chosen > 1 {
+        ui::error("--target, --prefix, and --targets-file are mutually exclusive");
+        return 2;
+    }
+
+    let mode: u8 = if target.is_some() { 0 } else if prefix.is_some() { 1 } else { 2 };
+    let exact_target = target.unwrap_or_default();
+    let vanity_prefix = prefix.unwrap_or_default();
+    let batch_targets: HashSet<String> = if let Some(ref p) = targets_file {
+        match std::fs::read_to_string(p) {
+            Ok(content) => content.lines().map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('#')).collect(),
+            Err(e) => { ui::error(&format!("Failed to read targets file: {}", e)); return 2; }
+        }
+    } else { HashSet::new() };
+
+    let num_threads = threads.unwrap_or_else(|| {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    });
+
+    let total_perms = factorial(12);
+    let is_random = random_count.is_some();
+    let total_work: u64 = if is_random { random_count.unwrap_or(0) } else { total_perms };
+    let ticket_size: u64 = num_tickets.map(|t| if t > 0 { (total_work + t - 1) / t } else { total_work }).unwrap_or(total_work);
+
+    // Checkpoint load
+    let mut cp_attempts_offset: u64 = 0;
+    let mut cp = if let Some(ref cp_path) = checkpoint_path {
+        if resume {
+            match CheckCheckpoint::load(cp_path) {
+                Ok(loaded) => {
+                    if !quiet {
+                        ui::section("Resuming from Checkpoint");
+                        ui::key_val_u64("Attempts", loaded.attempts);
+                        ui::key_val_u64("Checked", loaded.checked);
+                    }
+                    cp_attempts_offset = loaded.attempts;
+                    loaded
+                }
+                Err(e) => { ui::warn(&format!("No checkpoint: {}. Starting fresh.", e)); CheckCheckpoint::new() }
+            }
+        } else { CheckCheckpoint::new() }
+    } else { CheckCheckpoint::new() };
+
+    if !quiet {
+        ui::section("Permutation Check");
+        ui::key_val("Words", &words.join(" "));
+        match mode {
+            0 => ui::key_val("Target", &exact_target),
+            1 => ui::key_val("Prefix", &vanity_prefix),
+            _ => ui::key_val_u64("Targets", batch_targets.len() as u64),
+        }
+        ui::key_val("Path", &path);
+        ui::key_val_u64("Threads", num_threads as u64);
+        if is_random {
+            ui::key_val_u64("Random shuffles", total_work);
+        } else {
+            ui::key_val_u64("Total permutations", total_perms);
+            ui::key_val("Estimated valid", &format!("~{:.0}", (total_perms / 16) as f64));
+        }
+        ui::key_val_u64("Ticket size", ticket_size);
+        ui::separator();
+        log::info!("Permutation mode: {} words, {} work items, ticket_size={}", words.len(), total_work, ticket_size);
+    }
+
+    let (tx, rx) = mpsc::channel::<CheckWorkItem>();
+    let rx = Arc::new(Mutex::new(rx));
+
+    if is_random {
+        // Random mode: spawn N threads that each generate random shuffles
+        let words_owned = words.to_vec();
+        let gen_count = Arc::new(AtomicU64::new(0));
+        let gen_limit = total_work;
+        for _ in 0..num_threads {
+            let tx = tx.clone();
+            let words = words_owned.clone();
+            let gen_count = Arc::clone(&gen_count);
+            std::thread::spawn(move || {
+                let mut local_words = words.clone();
+                loop {
+                    if gen_count.load(Ordering::Relaxed) >= gen_limit { break; }
+                    let mut buf = [0u8; 16];
+                    getrandom::fill(&mut buf).unwrap_or_default();
+                    for i in (1..local_words.len()).rev() {
+                        let j = u64::from_ne_bytes(buf[0..8].try_into().unwrap()) as usize % (i + 1);
+                        local_words.swap(i, j);
+                        getrandom::fill(&mut buf).unwrap_or_default();
+                    }
+                    let phrase = local_words.join(" ");
+                    gen_count.fetch_add(1, Ordering::Relaxed);
+                    if tx.send(CheckWorkItem::Mnemonic(phrase)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    } else {
+        // Full permutation mode: generate all perms in background thread
+        let tx_clone = tx.clone();
+        let words_owned = words.to_vec();
+        std::thread::spawn(move || {
+            let mut words_copy = words_owned;
+            send_permutations(&tx_clone, &mut words_copy, 0);
+        });
+    }
+    drop(tx);
+
+    let checked = Arc::new(AtomicU64::new(0));
+    let valid_ctr = Arc::new(AtomicU64::new(0));
+    let match_count = Arc::new(AtomicU64::new(0));
+    let first_match = Arc::new(Mutex::new(None::<(String, String)>));
+    let found = Arc::new(AtomicBool::new(false));
+
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for thread_id in 0..num_threads {
+        let rx = Arc::clone(&rx);
+        let passphrase = passphrase.clone();
+        let path = path.clone();
+        let exact_target = exact_target.clone();
+        let vanity_prefix = vanity_prefix.clone();
+        let batch_targets = batch_targets.clone();
+        let checked = Arc::clone(&checked);
+        let valid_ctr = Arc::clone(&valid_ctr);
+        let match_count = Arc::clone(&match_count);
+        let first_match = Arc::clone(&first_match);
+        let found = Arc::clone(&found);
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                if found.load(Ordering::Relaxed) { break; }
+                let work = { let rx_guard = rx.lock().unwrap(); rx_guard.try_recv() };
+                match work {
+                    Ok(CheckWorkItem::Mnemonic(phrase)) => {
+                        let words: Vec<&str> = phrase.split_whitespace().collect();
+                        checked.fetch_add(1, Ordering::Relaxed);
+                        let result = check_one(&words, &passphrase, &path, mode, &exact_target, &vanity_prefix, &batch_targets, true);
+                        match result {
+                            CheckOutcome::Invalid => {}
+                            CheckOutcome::Derived(addr) => {
+                                valid_ctr.fetch_add(1, Ordering::Relaxed);
+                                let matched = match mode {
+                                    0 => addr == exact_target,
+                                    1 => addr.starts_with(&vanity_prefix),
+                                    _ => batch_targets.contains(&addr),
+                                };
+                                if matched {
+                                    match_count.fetch_add(1, Ordering::Relaxed);
+                                    let mut fm = first_match.lock().unwrap();
+                                    if fm.is_none() { *fm = Some((phrase.clone(), addr.clone())); }
+                                    ui::match_found(thread_id, &phrase, &addr);
+                                    if stop_on_first_match { found.store(true, Ordering::Relaxed); break; }
+                                }
+                            }
+                        }
+                    }
+                    Ok(CheckWorkItem::Random) => unreachable!(),
+                    Err(mpsc::TryRecvError::Empty) => { std::thread::sleep(std::time::Duration::from_millis(10)); }
+                    Err(mpsc::TryRecvError::Disconnected) => { break; }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Background checkpoint saver
+    let cp_saver = if checkpoint_path.is_some() {
+        let cp_path = checkpoint_path.clone().unwrap();
+        let checked = Arc::clone(&checked);
+        let valid_ctr = Arc::clone(&valid_ctr);
+        let match_count = Arc::clone(&match_count);
+        let first_match = Arc::clone(&first_match);
+        let found = Arc::clone(&found);
+        let start_time = cp.start_time;
+        Some(std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if found.load(Ordering::Relaxed) { break; }
+                let c = checked.load(Ordering::Relaxed);
+                let v = valid_ctr.load(Ordering::Relaxed);
+                let m = match_count.load(Ordering::Relaxed);
+                let fm = first_match.lock().unwrap().clone();
+                let cp = CheckCheckpoint {
+                    attempts: cp_attempts_offset + c, checked: c, valid: v,
+                    matches: m, found: fm, state: ScanState::Running,
+                    start_time, last_update: cp_timestamp(),
+                };
+                let _ = cp.save(&cp_path);
+            }
+        }))
+    } else { None };
+
+    for handle in handles { let _ = handle.join(); }
+    found.store(true, Ordering::Relaxed);
+    if let Some(h) = cp_saver { let _ = h.join(); }
+
+    let final_checked = checked.load(Ordering::Relaxed);
+    let final_valid = valid_ctr.load(Ordering::Relaxed);
+    let final_matches = match_count.load(Ordering::Relaxed);
+    let fm = first_match.lock().unwrap().clone();
+
+    // Final checkpoint save
+    if let Some(ref cp_path) = checkpoint_path {
+        cp.attempts = cp_attempts_offset + final_checked;
+        cp.checked = final_checked;
+        cp.valid = final_valid;
+        cp.matches = final_matches;
+        cp.found = fm.clone();
+        cp.state = if final_matches > 0 { ScanState::Found } else { ScanState::Completed };
+        cp.last_update = cp_timestamp();
+        let _ = cp.save(cp_path);
+    }
+
+    if !quiet {
+        ui::separator();
+        if let Some((ref phrase, ref addr)) = fm {
+            ui::success(&format!("First match: {} -> {}", phrase, addr));
+        }
+        ui::key_val_u64("Checked", final_checked);
+        ui::key_val_u64("Valid", final_valid);
+        ui::key_val_u64("Matches", final_matches);
+        ui::separator();
+    }
+
+    if final_matches > 0 { 0 } else { 3 }
 }
 
 fn cmd_check(
@@ -729,9 +1168,24 @@ fn cmd_check(
     quiet: bool,
     random: Option<u32>,
     max_attempts: u32,
+    checkpoint_path: Option<String>,
+    resume: bool,
+    threads: Option<usize>,
+    words_arg: Option<Vec<String>>,
+    random_shuffles: Option<u64>,
+    tickets: Option<u64>,
 ) -> i32 {
+    // Permutation mode: --words takes precedence
+    if let Some(ref words) = words_arg {
+        return cmd_check_permutations(
+            words, target, prefix, targets_file,
+            passphrase, path, stop_on_first_match, quiet,
+            checkpoint_path, resume, threads, random_shuffles, tickets,
+        );
+    }
+
     if mnemonic.is_none() && mnemonics_file.is_none() && random.is_none() {
-        eprintln!("One of --mnemonic, --mnemonics-file, or --random N is required");
+        ui::error("One of --mnemonic, --mnemonics-file, --random N, or --words is required");
         return 2;
     }
 
@@ -746,11 +1200,11 @@ fn cmd_check(
         chosen += 1;
     }
     if chosen == 0 {
-        eprintln!("One of --target, --prefix, or --targets-file must be supplied");
+        ui::error("One of --target, --prefix, or --targets-file must be supplied");
         return 2;
     }
     if chosen > 1 {
-        eprintln!("--target, --prefix, and --targets-file are mutually exclusive");
+        ui::error("--target, --prefix, and --targets-file are mutually exclusive");
         return 2;
     }
 
@@ -771,7 +1225,7 @@ fn cmd_check(
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .collect(),
             Err(e) => {
-                eprintln!("Failed to read targets file '{}': {}", p, e);
+                ui::error(&format!("Failed to read targets file '{}': {}", p, e));
                 return 2;
             }
         }
@@ -789,7 +1243,7 @@ fn cmd_check(
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .collect(),
             Err(e) => {
-                eprintln!("Failed to read mnemonics file '{}': {}", p, e);
+                ui::error(&format!("Failed to read mnemonics file '{}': {}", p, e));
                 return 2;
             }
         }
@@ -800,147 +1254,268 @@ fn cmd_check(
     let random_count = random.unwrap_or(0);
 
     if random_count == 0 && phrases.is_empty() {
-        eprintln!("No mnemonics to check");
+        ui::error("No mnemonics to check");
         return 2;
     }
 
-    if !quiet {
-        match mode {
-            0 => println!("Target: {}", exact_target),
-            1 => println!("Prefix: {}", vanity_prefix),
-            _ => println!("Targets: {} addresses", batch_targets.len()),
-        }
-        println!("Path: {}", path);
-        if random_count > 0 {
-            println!("Mode: random (will generate {} mnemonics)", random_count);
-            if max_attempts > 0 {
-                println!("Max attempts: {}", max_attempts);
+    let num_threads = threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
+
+    // Checkpoint: load or create
+    let mut cp_attempts_offset: u64 = 0;
+    let mut cp = if let Some(ref cp_path) = checkpoint_path {
+        if resume {
+            match CheckCheckpoint::load(cp_path) {
+                Ok(loaded) => {
+                    if !quiet {
+                        ui::section("Resuming from Checkpoint");
+                        ui::key_val_u64("Attempts", loaded.attempts);
+                        ui::key_val_u64("Checked", loaded.checked);
+                        ui::key_val_u64("Valid", loaded.valid);
+                        ui::key_val_u64("Matches", loaded.matches);
+                    }
+                    cp_attempts_offset = loaded.attempts;
+                    loaded
+                }
+                Err(e) => {
+                    ui::warn(&format!("Failed to load checkpoint: {}. Starting fresh.", e));
+                    CheckCheckpoint::new()
+                }
             }
         } else {
-            println!("Phrases: {}", phrases.len());
+            CheckCheckpoint::new()
         }
-        println!();
+    } else {
+        CheckCheckpoint::new()
+    };
+
+    if !quiet {
+        ui::section("Check Mnemonics");
+        match mode {
+            0 => ui::key_val("Target", &exact_target),
+            1 => ui::key_val("Prefix", &vanity_prefix),
+            _ => ui::key_val_u64("Targets", batch_targets.len() as u64),
+        }
+        ui::key_val("Path", &path);
+        ui::key_val_u64("Threads", num_threads as u64);
+        if random_count > 0 {
+            ui::key_val("Mode", &format!("random ({} mnemonics)", random_count));
+            if max_attempts > 0 {
+                ui::key_val_u64("Max attempts", max_attempts as u64);
+            }
+            if checkpoint_path.is_some() {
+                ui::key_val("Checkpoint", checkpoint_path.as_deref().unwrap());
+            }
+        } else {
+            ui::key_val_u64("Phrases", phrases.len() as u64);
+        }
+        ui::separator();
+        log::info!("Starting check: mode={}, threads={}", if random_count > 0 { "random" } else { "file" }, num_threads);
     }
 
-    let mut checked: usize = 0;
-    let mut valid: usize = 0;
-    let mut matches: usize = 0;
-    let mut first_match: Option<(String, String)> = None;
-    let mut found_in_supplied = false;
+    let checked = Arc::new(AtomicU64::new(0));
+    let valid_count = Arc::new(AtomicU64::new(0));
+    let match_count = Arc::new(AtomicU64::new(0));
+    let first_match = Arc::new(Mutex::new(None::<(String, String)>));
+    let found = Arc::new(AtomicBool::new(false));
+
+    let (tx, rx) = mpsc::channel::<CheckWorkItem>();
+    let rx = Arc::new(Mutex::new(rx));
 
     for phrase in &phrases {
-        checked += 1;
-        let words: Vec<&str> = phrase.split_whitespace().collect();
-
-        if !quiet {
-            println!("[{}/{}] {}", checked, phrases.len(), phrase);
-        }
-
-        let result = check_one(&words, &passphrase, &path, mode, &exact_target, &vanity_prefix, &batch_targets, quiet);
-        match result {
-            CheckOutcome::Invalid(msg) => {
-                if !quiet {
-                    println!("  -> INVALID: {}", msg);
-                }
-            }
-            CheckOutcome::Derived(addr) => {
-                valid += 1;
-                let matched = match mode {
-                    0 => addr == exact_target,
-                    1 => addr.starts_with(&vanity_prefix),
-                    _ => batch_targets.contains(&addr),
-                };
-                if matched {
-                    matches += 1;
-                    if first_match.is_none() {
-                        first_match = Some((phrase.clone(), addr.clone()));
-                    }
-                    println!("*** MATCH *** address: {}", addr);
-                    if stop_on_first_match {
-                        found_in_supplied = true;
-                        break;
-                    }
-                } else if !quiet {
-                    println!("  -> address: {} (no match)", addr);
-                }
-            }
-        }
+        let _ = tx.send(CheckWorkItem::Mnemonic(phrase.clone()));
     }
 
-    if !found_in_supplied && random_count > 0 {
-        if !quiet {
-            println!("Generating {} random mnemonics...", random_count);
-        }
-        let total_to_generate = if max_attempts == 0 || max_attempts > random_count {
+    if random_count > 0 && !found.load(Ordering::Relaxed) {
+        let gen_count = if max_attempts == 0 || max_attempts > random_count {
             random_count
         } else {
             max_attempts
         };
-
-        for _ in 0..total_to_generate {
-            checked += 1;
-
-            let phrase = match random_phrase() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Random generation failed: {}", e);
-                    return 1;
-                }
-            };
-
-            if !quiet {
-                println!("[{}/{}] {}", checked, total_to_generate as usize + phrases.len(), phrase);
-            }
-
-            let words: Vec<&str> = phrase.split_whitespace().collect();
-            let result = check_one(&words, &passphrase, &path, mode, &exact_target, &vanity_prefix, &batch_targets, quiet);
-            match result {
-                CheckOutcome::Invalid(msg) => {
-                    if !quiet {
-                        println!("  -> INVALID: {}", msg);
-                    }
-                }
-                CheckOutcome::Derived(addr) => {
-                    valid += 1;
-                    let matched = match mode {
-                        0 => addr == exact_target,
-                        1 => addr.starts_with(&vanity_prefix),
-                        _ => batch_targets.contains(&addr),
-                    };
-                    if matched {
-                        matches += 1;
-                        if first_match.is_none() {
-                            first_match = Some((phrase.clone(), addr.clone()));
-                        }
-                        println!("*** MATCH *** address: {}", addr);
-                        if stop_on_first_match {
-                            break;
-                        }
-                    } else if !quiet {
-                        println!("  -> address: {} (no match)", addr);
-                    }
-                }
-            }
+        for _ in 0..gen_count {
+            let _ = tx.send(CheckWorkItem::Random);
         }
     }
 
-    if !quiet {
-        println!();
-        println!(
-            "Checked: {}, Valid: {}, Matches: {}",
-            checked, valid, matches
-        );
+    drop(tx);
+
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for thread_id in 0..num_threads {
+        let rx = Arc::clone(&rx);
+        let passphrase = passphrase.clone();
+        let path = path.clone();
+        let exact_target = exact_target.clone();
+        let vanity_prefix = vanity_prefix.clone();
+        let batch_targets = batch_targets.clone();
+        let checked = Arc::clone(&checked);
+        let valid_count = Arc::clone(&valid_count);
+        let match_count = Arc::clone(&match_count);
+        let first_match = Arc::clone(&first_match);
+        let found = Arc::clone(&found);
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                if found.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let work = {
+                    let rx_guard = rx.lock().unwrap();
+                    rx_guard.try_recv()
+                };
+
+                match work {
+                    Ok(work) => {
+                        let phrase = match &work {
+                            CheckWorkItem::Mnemonic(p) => p.clone(),
+                            CheckWorkItem::Random => match random_phrase() {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            },
+                        };
+                        let words: Vec<&str> = phrase.split_whitespace().collect();
+
+                        checked.fetch_add(1, Ordering::Relaxed);
+
+                        let result = check_one(&words, &passphrase, &path, mode, &exact_target, &vanity_prefix, &batch_targets, true);
+
+                        match result {
+                            CheckOutcome::Invalid => {}
+                            CheckOutcome::Derived(addr) => {
+                                valid_count.fetch_add(1, Ordering::Relaxed);
+                                let matched = match mode {
+                                    0 => addr == exact_target,
+                                    1 => addr.starts_with(&vanity_prefix),
+                                    _ => batch_targets.contains(&addr),
+                                };
+                                if matched {
+                                    match_count.fetch_add(1, Ordering::Relaxed);
+                                    let mut fm = first_match.lock().unwrap();
+                                    if fm.is_none() {
+                                        *fm = Some((phrase.clone(), addr.clone()));
+                                    }
+                                    ui::match_found(thread_id, &phrase, &addr);
+                                    if stop_on_first_match {
+                                        found.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        handles.push(handle);
     }
 
-    if matches > 0 {
+    // Background checkpoint saver thread
+    let cp_saver = if checkpoint_path.is_some() && random_count > 0 {
+        let cp_path = checkpoint_path.clone().unwrap();
+        let checked = Arc::clone(&checked);
+        let valid_count = Arc::clone(&valid_count);
+        let match_count = Arc::clone(&match_count);
+        let first_match = Arc::clone(&first_match);
+        let found = Arc::clone(&found);
+        let cp_attempts_offset = cp_attempts_offset;
+        let start_time = cp.start_time;
+
+        Some(std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if found.load(Ordering::Relaxed) {
+                    break;
+                }
+                let c = checked.load(Ordering::Relaxed);
+                let v = valid_count.load(Ordering::Relaxed);
+                let m = match_count.load(Ordering::Relaxed);
+                let fm = first_match.lock().unwrap().clone();
+
+                let cp = CheckCheckpoint {
+                    attempts: cp_attempts_offset + c,
+                    checked: c,
+                    valid: v,
+                    matches: m,
+                    found: fm,
+                    state: ScanState::Running,
+                    start_time,
+                    last_update: cp_timestamp(),
+                };
+                let _ = cp.save(&cp_path);
+            }
+        }))
+    } else {
+        None
+    };
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    // Stop checkpoint saver
+    found.store(true, Ordering::Relaxed);
+    if let Some(h) = cp_saver {
+        let _ = h.join();
+    }
+
+    let final_checked = checked.load(Ordering::Relaxed);
+    let final_valid = valid_count.load(Ordering::Relaxed);
+    let final_matches = match_count.load(Ordering::Relaxed);
+    let fm = first_match.lock().unwrap().clone();
+
+    // Final checkpoint save
+    if let Some(ref cp_path) = checkpoint_path {
+        cp.attempts = cp_attempts_offset + final_checked;
+        cp.checked = final_checked;
+        cp.valid = final_valid;
+        cp.matches = final_matches;
+        cp.found = fm.clone();
+        cp.state = if final_matches > 0 {
+            ScanState::Found
+        } else {
+            ScanState::Completed
+        };
+        cp.last_update = cp_timestamp();
+        let _ = cp.save(cp_path);
+    }
+
+    if !quiet {
+        ui::separator();
+        if let Some((ref phrase, ref addr)) = fm {
+            ui::success(&format!("First match: {} -> {}", phrase, addr));
+        }
+        ui::key_val_u64("Checked", final_checked);
+        ui::key_val_u64("Valid", final_valid);
+        ui::key_val_u64("Matches", final_matches);
+        ui::separator();
+        log::info!("Check complete: checked={}, valid={}, matches={}", final_checked, final_valid, final_matches);
+    }
+
+    if final_matches > 0 {
         0
     } else {
         3
     }
 }
 
+enum CheckWorkItem {
+    Mnemonic(String),
+    Random,
+}
+
 enum CheckOutcome {
-    Invalid(String),
+    Invalid,
     Derived(String),
 }
 
@@ -954,24 +1529,31 @@ fn check_one(
     _targets: &HashSet<String>,
     _quiet: bool,
 ) -> CheckOutcome {
-    if let Err(e) = Bip39::validate(words) {
-        return CheckOutcome::Invalid(e);
+    if let Err(_e) = Bip39::validate(words) {
+        return CheckOutcome::Invalid;
     }
-    let seed = Bip39::mnemonic_to_seed(words, passphrase).unwrap();
-    let master = Bip32::from_seed(&seed);
-    let derived = Bip32::derive_path(&master, path);
+    let seed = match Bip39::mnemonic_to_seed(words, passphrase) {
+        Ok(s) => s,
+        Err(_e) => return CheckOutcome::Invalid,
+    };
+    let master = match Bip32::from_seed(&seed) {
+        Ok(m) => m,
+        Err(_e) => return CheckOutcome::Invalid,
+    };
+    let derived = match Bip32::derive_path(&master, path) {
+        Ok(d) => d,
+        Err(_e) => return CheckOutcome::Invalid,
+    };
     match Bip32::privkey_to_address(&derived.key) {
         Ok(a) => CheckOutcome::Derived(a),
-        Err(e) => CheckOutcome::Invalid(format!("address derivation failed: {}", e)),
+        Err(_e) => CheckOutcome::Invalid,
     }
 }
 
 fn random_phrase() -> Result<String, String> {
     let mut ent = [0u8; 16];
-    if let Err(e) = fill_random(&mut ent) {
-        return Err(format!("entropy fill failed: {}", e));
-    }
-    let words = Bip39::entropy_to_words(&ent)?;
+    fill_random(&mut ent)?;
+    let words = Bip39::entropy_to_words(&ent).map_err(|e| e.to_string())?;
     Ok(words.join(" "))
 }
 
@@ -981,24 +1563,25 @@ fn cmd_generate(count: Option<u32>, entropy_arg: Option<String>) {
         Some(s) => match s.parse() {
             Ok(n) if [16, 20, 24, 28, 32].contains(&n) => n,
             Ok(n) => {
-                eprintln!(
+                ui::error(&format!(
                     "Invalid entropy size {}: must be one of 16, 20, 24, 28, 32",
                     n
-                );
+                ));
                 std::process::exit(2);
             }
             Err(e) => {
-                eprintln!("Invalid entropy size '{}': {}", s, e);
+                ui::error(&format!("Invalid entropy size '{}': {}", s, e));
                 std::process::exit(2);
             }
         },
         None => 16,
     };
 
+    log::info!("Generating {} mnemonics (entropy: {} bytes)", count, entropy_size);
     for _ in 0..count {
         let mut ent = vec![0u8; entropy_size];
         if let Err(e) = fill_random(&mut ent) {
-            eprintln!("Failed to read random bytes: {}", e);
+            ui::error(&format!("Failed to generate random bytes: {}", e));
             std::process::exit(1);
         }
 
@@ -1007,73 +1590,57 @@ fn cmd_generate(count: Option<u32>, entropy_arg: Option<String>) {
                 println!("{}", words.join(" "));
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                ui::error(&format!("Error: {}", e));
             }
         }
     }
 }
 
-fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let s = RandomState::new();
-    let mut hasher = s.build_hasher();
-    hasher.write_u64(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64,
-    );
-    let seed = hasher.finish();
-    let mut state = seed;
-    for b in buf.iter_mut() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *b = (state >> 33) as u8;
-    }
-    Ok(())
+fn fill_random(buf: &mut [u8]) -> Result<(), String> {
+    getrandom::fill(buf).map_err(|e| format!("getrandom failed: {}", e))
 }
 
 fn cmd_config(output: &str) {
     let content = Config::default_config_file();
     std::fs::write(output, content).unwrap_or_else(|e| {
-        eprintln!("Failed to write config: {}", e);
+        ui::error(&format!("Failed to write config: {}", e));
         std::process::exit(1);
     });
-    println!("Default config written to {}", output);
+    ui::success(&format!("Default config written to {}", output));
 }
 
 fn cmd_checkpoint(file: &str, action: CheckpointAction) {
     match action {
         CheckpointAction::Show => match Checkpoint::load(file) {
             Ok(cp) => {
-                println!("=== Checkpoint Status ===");
-                println!("State: {:?}", cp.state);
-                println!("Index: {}", cp.current_index);
-                println!("Scanned: {} / {}", cp.scanned_count, cp.total_combinations);
-                println!("Progress: {:.4}%", cp.progress_pct());
-                println!("Rate: {:.0}/s", cp.rate());
-                println!("Elapsed: {}s", cp.elapsed_seconds());
+                ui::section("Checkpoint Status");
+                ui::key_val("State", &format!("{:?}", cp.state));
+                ui::key_val_u64("Index", cp.current_index);
+                ui::key_val(&format!("Scanned"), &format!("{} / {}", cp.scanned_count, cp.total_combinations));
+                ui::key_val_f64("Progress %", cp.progress_pct());
+                ui::key_val_f64("Rate /s", cp.rate());
+                ui::key_val_u64("Elapsed (s)", cp.elapsed_seconds());
                 if let Some(ref addr) = cp.found_address {
-                    println!("Found: {}", addr);
+                    ui::key_val("Found", addr);
                 }
             }
             Err(e) => {
-                eprintln!("Failed to load checkpoint: {}", e);
+                ui::error(&format!("Failed to load checkpoint: {}", e));
             }
         },
         CheckpointAction::Reset => {
             let cp = Checkpoint::new(2048u64.pow(11));
             let _ = cp.save(file);
-            println!("Checkpoint reset");
+            ui::success("Checkpoint reset");
         }
         CheckpointAction::Resume => match Checkpoint::load(file) {
             Ok(mut cp) => {
                 cp.state = ScanState::Running;
                 let _ = cp.save(file);
-                println!("Checkpoint set to resume from index {}", cp.current_index);
+                ui::success(&format!("Checkpoint set to resume from index {}", cp.current_index));
             }
             Err(e) => {
-                eprintln!("Failed to load checkpoint: {}", e);
+                ui::error(&format!("Failed to load checkpoint: {}", e));
             }
         },
     }
@@ -1083,14 +1650,14 @@ fn cmd_ticket(checkpoint_path: &str, ticket_size: u64) {
     let total: u64 = 2048u64.pow(11);
     let tm = TicketManager::new(total, ticket_size);
 
-    println!("=== Ticket Manager ===");
-    println!("Total: {}", total);
-    println!("Ticket size: {}", ticket_size);
-    println!("Tickets: {}", tm.tickets.len());
-    println!();
+    ui::section("Ticket Manager");
+    ui::key_val_u64("Total", total);
+    ui::key_val_u64("Ticket size", ticket_size);
+    ui::key_val_u64("Tickets", tm.tickets.len() as u64);
+    ui::separator();
 
     let ticket_file = format!("{}.tickets", checkpoint_path);
     if let Ok(_) = tm.save(&ticket_file) {
-        println!("Tickets saved to {}", ticket_file);
+        ui::success(&format!("Tickets saved to {}", ticket_file));
     }
 }

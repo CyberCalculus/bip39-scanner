@@ -1,19 +1,21 @@
 # bip39-scanner
 
-A BIP39 mnemonic scanner for Bitcoin bech32 addresses. All crypto primitives
-(SHA-256, SHA-512, HMAC, RIPEMD-160, PBKDF2, secp256k1, Bech32) are
-implemented from scratch — no external crypto crates are used. The only
-dependencies are `clap`, `serde`, `serde_json`, and `toml`.
+A BIP39 mnemonic scanner for Bitcoin bech32 addresses. All cryptography is
+delegated to audited crates (`k256`, `bech32`, `sha2`, `ripemd`, `hmac`,
+`pbkdf2`, `getrandom`). Multi-threaded via `std::thread`.
 
 ## Features
 
 - Walks the full 12-word BIP39 mnemonic space (`2^132` combinations).
+- Multi-threaded scanning via `std::thread` (auto-detects CPU count).
+- Background checkpoint saver (non-blocking persistence every 5s).
 - Match modes: exact address, vanity prefix, or batch list from a file.
 - Checkpoint + resume: progress is persisted to a JSON file every N mnemonics.
 - Ticket manager: pre-computed contiguous work ranges for distributed workers.
 - Validate a single mnemonic and print its derived bech32 address.
 - Generate 12 / 15 / 18 / 21 / 24-word mnemonics from any of the five
   standard entropy sizes (128 / 160 / 192 / 224 / 256 bits).
+- Parallel batch mnemonic verification (`check --mnemonics-file`).
 - Export a hit record (`timestamp\tindex\tmnemonic\taddress`) to a file.
 - TOML config file with sensible defaults; CLI flags always override config.
 
@@ -135,16 +137,10 @@ bip39-scanner ticket --checkpoint cp.json --ticket-size 1000000
 ```
 src/
 ├── lib.rs           # public module re-exports
-├── main.rs          # CLI (clap derive) + scan loop
-├── sha256.rs        # SHA-256
-├── sha512.rs        # SHA-512
-├── hmac.rs          # HMAC-SHA512
-├── ripemd160.rs     # RIPEMD-160 + HASH160
-├── pbkdf2.rs        # PBKDF2-HMAC-SHA512
-├── secp256k1.rs     # secp256k1 field + point ops + ECDSA-secp256k1 pubkey
-├── bech32.rs        # Bech32 + Bech32m (segwit address encoding)
+├── main.rs          # CLI (clap derive) + multi-threaded scan loop
 ├── bip39.rs         # wordlist (2048 words), entropy ↔ mnemonic, checksum
 ├── bip32.rs         # master-from-seed + CKDpriv + path parsing
+├── bitcoin.rs       # SegWit address encoding via bech32 crate
 ├── config.rs        # TOML config types + load/save/default
 ├── checkpoint.rs    # resumable scan state (JSON)
 └── ticket.rs        # fixed-size work tickets (JSON)
@@ -161,6 +157,7 @@ The crate ships unit tests for:
   mnemonics.
 - Word index round-trips for all 2048 wordlist entries.
 - BIP32 master-from-seed, child derivation, depth, and address format.
+- Bech32 encode/decode with BIP173 test vectors.
 
 ## License
 

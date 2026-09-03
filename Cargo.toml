@@ -1,11 +1,30 @@
 [package]
 name = "bip39-scanner"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "BIP39 mnemonic scanner - own crypto, no external crypto deps"
+description = "BIP39 mnemonic scanner for Bitcoin bech32 addresses. Multi-threaded. All crypto delegated to audited crates."
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
+clap = { version = "4.6.6", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.5"
+
+# Audited cryptographic primitives
+k256 = { version = "0.14.0", features = ["arithmetic"] }
+elliptic-curve = "0.14.1"
+bech32 = "0.12.0"
+getrandom = "0.4.3"
+ripemd = "0.2.0"
+sha2 = "0.11.0"
+hmac = "0.13.0"
+pbkdf2 = "0.13.0"
+hex-literal = "0.4"
+
+# Logging and CLI styling
+log = "0.4"
+env_logger = "0.11"
+colored = "2"
+
+[dev-dependencies]
+hex = "0.4"
